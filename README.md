@@ -1,4 +1,4 @@
-# Gushing Over Blender
+# Gushing-Over-Magical-UI
 
 A dark, magical-girl-inspired UI theme for Blender — plus an optional companion add-on that brings the same aesthetic into procedural viewport effects, readability improvements, and a live theme animator.
 
