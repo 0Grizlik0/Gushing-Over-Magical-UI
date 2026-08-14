@@ -122,6 +122,12 @@ class GSH_State:
         self.outline_offscreens = {}
         self.batch_cache = {}
         self.bone_batch_cache = {}
+        # Objects whose cached batch is known stale (geometry changed) but a
+        # rebuild hasn't happened yet. Kept separate from batch_cache so the
+        # last-known-good batch can still be drawn (throttled) instead of the
+        # rebuild happening synchronously on every single depsgraph tick.
+        self.batch_dirty = set()
+        self.batch_last_build = {}
 
 gsh_state = GSH_State()
 
@@ -1422,28 +1428,62 @@ def gsh_outline_on_depsgraph_update(scene, depsgraph):
     prefs = get_prefs(bpy.context)
     if not prefs or (not prefs.gsh_viewport_outline_enabled and not prefs.gsh_node_outline_enabled):
         return
-        
-    clear_all = False
+
     for update in depsgraph.updates:
         if isinstance(update.id, bpy.types.Object):
-            gsh_state.batch_cache.pop(update.id.name, None)
-            if update.id.type == 'ARMATURE':
-                clear_all = True
+            # is_updated_geometry is documented as tracking the *object's*
+            # evaluated geometry, so it's the correct signal here: a pure
+            # transform/selection update (e.g. dragging the Move/Rotate/Scale
+            # gizmo) leaves it False, and local-space geometry is untouched --
+            # matrix_world is re-applied fresh every draw as a shader uniform,
+            # so there's nothing to rebuild. Treating every transform tick as
+            # "needs rebuild" used to force a full to_mesh() + modifier
+            # re-evaluation + fresh GPU buffer upload on *every* mouse-move
+            # frame of *any* move/rotate/scale -- exactly what starves the
+            # redraws that Active-Tool gizmo hover/drag interaction depends on.
+            if update.is_updated_geometry:
+                gsh_state.batch_dirty.add(update.id.name)
         elif isinstance(update.id, (bpy.types.Mesh, bpy.types.Curve)):
-            clear_all = True
-            
-    if clear_all:
-        gsh_state.batch_cache.clear()
+            # NOTE: is_updated_geometry is NOT a reliable signal here -- it's
+            # documented as tracking object geometry, not datablock updates,
+            # and is often simply unset for Mesh/Curve IDs (e.g. edits made
+            # while in Edit Mode, or right after leaving it, were being missed
+            # entirely when this branch was gated by that flag, which left the
+            # outline stuck showing the mesh's shape from *before* the edit).
+            # A Mesh/Curve ID showing up in depsgraph.updates at all already
+            # means something about it changed, so invalidate unconditionally
+            # here -- same as the original code -- but still scoped to just
+            # the objects that actually use this datablock, instead of
+            # wiping every cached batch in the scene. Live-editing one mesh
+            # (e.g. a Skin modifier cage while resizing its radius with
+            # Ctrl+A) used to blow away every *other* object's cache too,
+            # multiplying how many to_mesh() calls and GPU buffer uploads
+            # happened per redraw during a fast-firing modal operator -- the
+            # main driver behind crashes while resizing Skin geometry.
+            for name in list(gsh_state.batch_cache.keys()) + list(gsh_state.batch_dirty):
+                ob = bpy.data.objects.get(name)
+                if ob is None:
+                    # Object no longer exists -- drop it outright instead of
+                    # endlessly re-marking a name that will never resolve again.
+                    gsh_state.batch_cache.pop(name, None)
+                    gsh_state.batch_dirty.discard(name)
+                    gsh_state.batch_last_build.pop(name, None)
+                elif getattr(ob, "data", None) == update.id:
+                    gsh_state.batch_dirty.add(name)
 
 @persistent
 def gsh_on_frame_change(scene, *args, **kwargs):
-    gsh_state.batch_cache.clear()
+    # Mark everything dirty rather than dropping it outright: gsh_get_or_build_batch
+    # will still redraw the last-known-good silhouette (throttled) while scrubbing
+    # the timeline quickly, instead of forcing a synchronous rebuild every frame.
+    gsh_state.batch_dirty.update(gsh_state.batch_cache.keys())
 
 def gsh_build_batch_fast(obj, depsgraph):
     if not HAS_NUMPY: return None, None
     eval_obj = obj.evaluated_get(depsgraph)
-    mesh = eval_obj.to_mesh()
+    mesh = None
     try:
+        mesh = eval_obj.to_mesh()
         if mesh is None or len(mesh.vertices) == 0: return None, None
         mesh.calc_loop_triangles()
         n_verts = len(mesh.vertices)
@@ -1454,6 +1494,19 @@ def gsh_build_batch_fast(obj, depsgraph):
         if n_tris == 0: return None, None
         tri_idx = np.empty(n_tris * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("vertices", tri_idx)
+        # Defensive validation before this ever reaches the GPU: Blender's gpu
+        # module does not bounds-check GPUIndexBuf/GPUVertBuf data supplied from
+        # Python, and a length/range mismatch there is a known source of
+        # out-of-bounds GPU reads (i.e. hard crashes, not Python exceptions).
+        # Geometry-generating modifiers like Skin can, while their parameters
+        # are actively being dragged (e.g. Ctrl+A resize), transiently emit
+        # loop triangles faster than this cache can validate them against a
+        # matching vertex count, so bail out quietly rather than trust the data.
+        if tri_idx.size == 0 or (n_tris * 3) != tri_idx.size:
+            return None, None
+        if int(tri_idx.min()) < 0 or int(tri_idx.max()) >= n_verts:
+            gbfx_state.log_error("gsh_build_batch_fast", ValueError(f"loop_triangles index out of range for {obj.name!r}"))
+            return None, None
         tri_idx = tri_idx.reshape(-1, 3)
         local_center = ((co.min(axis=0) + co.max(axis=0)) / 2.0).tolist()
         fmt = gpu.types.GPUVertFormat()
@@ -1463,50 +1516,95 @@ def gsh_build_batch_fast(obj, depsgraph):
         ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=tri_idx)
         batch = gpu.types.GPUBatch(type='TRIS', buf=vbo, elem=ibo)
         return batch, local_center
+    except Exception as e:
+        gbfx_state.log_error(f"gsh_build_batch_fast ({getattr(obj, 'name', '?')})", e)
+        return None, None
     finally:
-        if eval_obj and hasattr(eval_obj, 'to_mesh_clear'): eval_obj.to_mesh_clear()
+        if eval_obj is not None and hasattr(eval_obj, 'to_mesh_clear'):
+            try: eval_obj.to_mesh_clear()
+            except Exception as e: gbfx_state.log_error("gsh_build_batch_fast to_mesh_clear", e)
+
+# Minimum time between forced rebuilds of the same object's GPU batch while it
+# keeps getting marked dirty (e.g. a modal operator like Skin resize firing a
+# depsgraph update on every mouse-move). Caps how often to_mesh() + a fresh
+# VBO/IBO/Batch upload can happen for one object, regardless of how fast the
+# underlying modal operator ticks, which both keeps redraws responsive (so
+# Active-Tool gizmo interaction stays snappy) and avoids hammering the GPU
+# driver with unthrottled allocations -- the main crash risk while live-editing
+# geometry-generating modifiers.
+GSH_BATCH_REBUILD_MIN_INTERVAL = 0.05
 
 def gsh_get_or_build_batch(obj, depsgraph):
     mode = bpy.context.mode
     if obj == bpy.context.active_object and mode in {'PAINT_VERTEX', 'PAINT_WEIGHT', 'PAINT_TEXTURE'}:
         return gsh_build_batch_fast(obj, depsgraph)
-    cached = gsh_state.batch_cache.get(obj.name)
-    if cached is not None: return cached
+
+    name = obj.name
+    cached = gsh_state.batch_cache.get(name)
+    dirty = name in gsh_state.batch_dirty
+
+    if cached is not None and not dirty:
+        return cached
+
+    if cached is not None and dirty:
+        last_build = gsh_state.batch_last_build.get(name, 0.0)
+        if (time.time() - last_build) < GSH_BATCH_REBUILD_MIN_INTERVAL:
+            # Still within the throttle window: keep drawing the last-known-good
+            # batch this frame rather than rebuilding right now.
+            return cached
+
     entry = gsh_build_batch_fast(obj, depsgraph)
-    gsh_state.batch_cache[obj.name] = entry
-    return entry
+    gsh_state.batch_last_build[name] = time.time()
+    gsh_state.batch_dirty.discard(name)
+    if entry[0] is not None:
+        gsh_state.batch_cache[name] = entry
+        return entry
+    # Rebuild failed/produced nothing usable (e.g. transient degenerate
+    # geometry mid-drag) -- fall back to the last-known-good batch if we have
+    # one instead of drawing nothing for a frame.
+    return cached if cached is not None else entry
 
 def gsh_build_edit_mode_batches(obj):
     if not HAS_NUMPY: return [], None
-    try: bm = bmesh.from_edit_mesh(obj.data)
-    except Exception as e: gbfx_state.log_error("build_edit_mode_batches", e); return [], None
-    active_elem = bm.select_history.active
-    if not active_elem or not getattr(active_elem, 'select', False): return [], None
-    batches = []
-    if isinstance(active_elem, bmesh.types.BMFace):
-        pos = []
-        verts = [v.co[:] for v in active_elem.verts]
-        for i in range(1, len(verts) - 1):
-            pos.append(verts[0]); pos.append(verts[i]); pos.append(verts[i + 1])
-        if pos:
-            fmt = gpu.types.GPUVertFormat()
-            fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        active_elem = bm.select_history.active
+        if not active_elem or not getattr(active_elem, 'select', False): return [], None
+        batches = []
+        if isinstance(active_elem, bmesh.types.BMFace):
+            pos = []
+            verts = [v.co[:] for v in active_elem.verts]
+            for i in range(1, len(verts) - 1):
+                pos.append(verts[0]); pos.append(verts[i]); pos.append(verts[i + 1])
+            if pos:
+                fmt = gpu.types.GPUVertFormat()
+                fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+                vbo = gpu.types.GPUVertBuf(fmt, len(pos)); vbo.attr_fill(id="pos", data=pos)
+                batches.append(('TRIS', gpu.types.GPUBatch(type='TRIS', buf=vbo), None))
+        elif isinstance(active_elem, bmesh.types.BMEdge):
+            pos = [active_elem.verts[0].co[:], active_elem.verts[1].co[:]]
+            fmt = gpu.types.GPUVertFormat(); fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
             vbo = gpu.types.GPUVertBuf(fmt, len(pos)); vbo.attr_fill(id="pos", data=pos)
-            batches.append(('TRIS', gpu.types.GPUBatch(type='TRIS', buf=vbo), None))
-    elif isinstance(active_elem, bmesh.types.BMEdge):
-        pos = [active_elem.verts[0].co[:], active_elem.verts[1].co[:]]
-        fmt = gpu.types.GPUVertFormat(); fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        vbo = gpu.types.GPUVertBuf(fmt, len(pos)); vbo.attr_fill(id="pos", data=pos)
-        batches.append(('LINES', gpu.types.GPUBatch(type='LINES', buf=vbo), 3.0))
-    elif isinstance(active_elem, bmesh.types.BMVert):
-        pos = [active_elem.co[:]]
-        fmt = gpu.types.GPUVertFormat(); fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        vbo = gpu.types.GPUVertBuf(fmt, len(pos)); vbo.attr_fill(id="pos", data=pos)
-        batches.append(('POINTS', gpu.types.GPUBatch(type='POINTS', buf=vbo), 8.0))
-    else: return [], None
-    coords = np.array([v.co if hasattr(v, 'co') else v for v in getattr(active_elem, 'verts', [active_elem])], dtype=np.float32)
-    sel_center = ((coords.min(axis=0) + coords.max(axis=0)) / 2.0).tolist()
-    return batches, sel_center
+            batches.append(('LINES', gpu.types.GPUBatch(type='LINES', buf=vbo), 3.0))
+        elif isinstance(active_elem, bmesh.types.BMVert):
+            pos = [active_elem.co[:]]
+            fmt = gpu.types.GPUVertFormat(); fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            vbo = gpu.types.GPUVertBuf(fmt, len(pos)); vbo.attr_fill(id="pos", data=pos)
+            batches.append(('POINTS', gpu.types.GPUBatch(type='POINTS', buf=vbo), 8.0))
+        else:
+            return [], None
+        coords = np.array([v.co if hasattr(v, 'co') else v for v in getattr(active_elem, 'verts', [active_elem])], dtype=np.float32)
+        sel_center = ((coords.min(axis=0) + coords.max(axis=0)) / 2.0).tolist()
+        return batches, sel_center
+    except Exception as e:
+        # bm.select_history.active and its .co/.verts read directly from the
+        # *live* BMesh a modal operator (e.g. Ctrl+A Skin resize) may be
+        # actively mutating. That can transiently raise (for example a
+        # ReferenceError on an element mid-update) even though nothing is
+        # really wrong -- skip this frame's highlight rather than let it
+        # propagate out of a GPU draw callback.
+        gbfx_state.log_error(f"gsh_build_edit_mode_batches ({getattr(obj, 'name', '?')})", e)
+        return [], None
 
 def gsh_get_bone_shape_batch(bone, display_type):
     if not HAS_NUMPY: return None, None, None
@@ -1661,23 +1759,31 @@ def gsh_render_mask(offscreen, active_batches, occluder_batches, view_proj, dept
     with offscreen.bind():
         fb = gpu.state.active_framebuffer_get()
         fb.clear(color=(0.0, 0.0, 0.0, 0.0), depth=1.0)
-        if depth_test and occluder_batches:
-            gpu.state.depth_test_set("LESS_EQUAL"); gpu.state.color_mask_set(False, False, False, False); gpu.state.depth_mask_set(True)
-            depth_shader.bind(); depth_shader.uniform_float("viewProjectionMatrix", view_proj)
-            for batch, model_matrix in occluder_batches:
-                depth_shader.uniform_float("modelMatrix", model_matrix); batch.draw(depth_shader)
-            gpu.state.color_mask_set(True, True, True, True); gpu.state.depth_mask_set(False)
-        else:
-            gpu.state.depth_test_set("NONE"); gpu.state.color_mask_set(True, True, True, True); gpu.state.depth_mask_set(True)
-        mask_shader.bind(); mask_shader.uniform_float("viewProjectionMatrix", view_proj)
-        for prim_type, batch, model_matrix, extra in active_batches:
-            mask_shader.uniform_float("modelMatrix", model_matrix)
-            if prim_type == 'LINES':
-                gpu.state.line_width_set(extra or 3.0); batch.draw(mask_shader); gpu.state.line_width_set(1.0)
-            elif prim_type == 'POINTS':
-                gpu.state.point_size_set(extra or 8.0); batch.draw(mask_shader); gpu.state.point_size_set(1.0)
-            else: batch.draw(mask_shader)
-        gpu.state.depth_test_set("NONE"); gpu.state.depth_mask_set(True); gpu.state.color_mask_set(True, True, True, True)
+        try:
+            if depth_test and occluder_batches:
+                gpu.state.depth_test_set("LESS_EQUAL"); gpu.state.color_mask_set(False, False, False, False); gpu.state.depth_mask_set(True)
+                depth_shader.bind(); depth_shader.uniform_float("viewProjectionMatrix", view_proj)
+                for batch, model_matrix in occluder_batches:
+                    depth_shader.uniform_float("modelMatrix", model_matrix); batch.draw(depth_shader)
+                gpu.state.color_mask_set(True, True, True, True); gpu.state.depth_mask_set(False)
+            else:
+                gpu.state.depth_test_set("NONE"); gpu.state.color_mask_set(True, True, True, True); gpu.state.depth_mask_set(True)
+            mask_shader.bind(); mask_shader.uniform_float("viewProjectionMatrix", view_proj)
+            for prim_type, batch, model_matrix, extra in active_batches:
+                mask_shader.uniform_float("modelMatrix", model_matrix)
+                if prim_type == 'LINES':
+                    gpu.state.line_width_set(extra or 3.0); batch.draw(mask_shader); gpu.state.line_width_set(1.0)
+                elif prim_type == 'POINTS':
+                    gpu.state.point_size_set(extra or 8.0); batch.draw(mask_shader); gpu.state.point_size_set(1.0)
+                else: batch.draw(mask_shader)
+        finally:
+            # Always land back on a known-good pipeline state, even if a
+            # batch.draw() call above raised partway through. Leaving e.g.
+            # color writes disabled (from the occluder pre-pass) would silently
+            # break *everything* drawn afterwards in this viewport for the rest
+            # of the frame -- including Blender's own gizmo/overlay drawing.
+            gpu.state.depth_test_set("NONE"); gpu.state.depth_mask_set(True); gpu.state.color_mask_set(True, True, True, True)
+            gpu.state.line_width_set(1.0); gpu.state.point_size_set(1.0)
 
 def gsh__composite_outline(offscreen, region, pivot_screen, prefs):
     shader = gsh__get_outline_compose_shader()
@@ -1686,15 +1792,20 @@ def gsh__composite_outline(offscreen, region, pivot_screen, prefs):
     indices = [(0, 1, 2), (2, 3, 0)]
     batch = batch_for_shader(shader, "TRIS", {"pos": verts}, indices=indices)
     colors = [tuple(c) for c in gbfx_colors(prefs)]
-    gpu.state.depth_test_set("NONE"); gpu.state.blend_set("ALPHA")
-    shader.bind()
-    shader.uniform_sampler("mask_tex", offscreen.texture_color) 
-    shader.uniform_float("u_resolution", (width, height)); shader.uniform_float("texel_size", (1.0 / width, 1.0 / height))
-    shader.uniform_float("outline_px", prefs.gsh_viewport_outline_width); shader.uniform_float("pivot_screen", pivot_screen)
-    shader.uniform_float("phase01", gsh_state.outline_rot)
-    shader.uniform_float("color0", colors[0]); shader.uniform_float("color1", colors[1]); shader.uniform_float("color2", colors[2]); shader.uniform_float("color3", colors[3])
-    batch.draw(shader)
-    gpu.state.blend_set("NONE"); gpu.state.depth_test_set("LESS_EQUAL")
+    try:
+        gpu.state.depth_test_set("NONE"); gpu.state.blend_set("ALPHA")
+        shader.bind()
+        shader.uniform_sampler("mask_tex", offscreen.texture_color) 
+        shader.uniform_float("u_resolution", (width, height)); shader.uniform_float("texel_size", (1.0 / width, 1.0 / height))
+        shader.uniform_float("outline_px", prefs.gsh_viewport_outline_width); shader.uniform_float("pivot_screen", pivot_screen)
+        shader.uniform_float("phase01", gsh_state.outline_rot)
+        shader.uniform_float("color0", colors[0]); shader.uniform_float("color1", colors[1]); shader.uniform_float("color2", colors[2]); shader.uniform_float("color3", colors[3])
+        batch.draw(shader)
+    finally:
+        # Same reasoning as gsh_render_mask: always restore blend/depth state
+        # to Blender's expected defaults for the rest of the viewport draw,
+        # even if the composite draw call above failed.
+        gpu.state.blend_set("NONE"); gpu.state.depth_test_set("LESS_EQUAL")
 
 def gsh__draw_node_outline():
     try:
@@ -1734,6 +1845,27 @@ def gsh__draw_node_outline():
     except Exception as e: gbfx_state.log_error("_draw_node_outline", e)
 
 def gsh_draw_viewport_outline():
+    try:
+        _gsh_draw_viewport_outline_impl()
+    except Exception as e:
+        gbfx_state.log_error("gsh_draw_viewport_outline", e)
+        # Best-effort safety net: make sure nothing later in this frame -- most
+        # importantly Blender's own gizmo/overlay drawing -- inherits a broken
+        # pipeline state (disabled color writes, stuck blend mode, etc.) left
+        # behind by whichever step above failed before it could restore things
+        # itself. This is on top of (not a replacement for) the try/finally
+        # blocks inside gsh_render_mask/gsh__composite_outline.
+        try:
+            gpu.state.color_mask_set(True, True, True, True)
+            gpu.state.depth_mask_set(True)
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.blend_set("NONE")
+            gpu.state.line_width_set(1.0)
+            gpu.state.point_size_set(1.0)
+        except Exception:
+            pass
+
+def _gsh_draw_viewport_outline_impl():
     context = bpy.context
     prefs = get_prefs(context)
     if not prefs or not prefs.gsh_viewport_outline_enabled: return
@@ -2109,6 +2241,8 @@ def gbfx__on_file_load(scene, depsgraph=None):
     gsh_state.node_handle = None
     gsh_state.border_handle = None
     gsh_state.batch_cache.clear()
+    gsh_state.batch_dirty.clear()
+    gsh_state.batch_last_build.clear()
     gsh__free_outline_offscreens()
     
     bpy.app.timers.register(gbfx__autostart_effects, first_interval=0.5)
@@ -2211,6 +2345,8 @@ def unregister():
         
     gsh__free_outline_offscreens()
     gsh_state.batch_cache.clear()
+    gsh_state.batch_dirty.clear()
+    gsh_state.batch_last_build.clear()
     
     try: gsh_restore_theme()
     except Exception as e: gbfx_state.log_error("unregister restore_theme", e)
